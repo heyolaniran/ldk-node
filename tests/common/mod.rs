@@ -98,6 +98,34 @@ macro_rules! expect_channel_ready_event {
 
 pub(crate) use expect_channel_ready_event;
 
+macro_rules! expect_channel_ready_events {
+	($node:expr, $counterparty_node_id_a:expr, $counterparty_node_id_b:expr) => {{
+		let mut ids = Vec::new();
+		for _ in 0..2 {
+			match $node.next_event_async().await {
+				ref e @ Event::ChannelReady { counterparty_node_id, .. } => {
+					println!("{} got event {:?}", $node.node_id(), e);
+					ids.push(counterparty_node_id);
+					$node.event_handled().unwrap();
+				},
+				ref e => {
+					panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
+				},
+			}
+		}
+		assert!(
+			ids.contains(&Some($counterparty_node_id_a))
+				&& ids.contains(&Some($counterparty_node_id_b)),
+			"Expected ChannelReady events from {:?} and {:?}, but got {:?}",
+			$counterparty_node_id_a,
+			$counterparty_node_id_b,
+			ids
+		);
+	}};
+}
+
+pub(crate) use expect_channel_ready_events;
+
 macro_rules! expect_splice_pending_event {
 	($node:expr, $counterparty_node_id:expr) => {{
 		match $node.next_event_async().await {
@@ -206,6 +234,31 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	(bitcoind, electrsd)
 }
 
+pub(crate) fn random_chain_source<'a>(
+	bitcoind: &'a BitcoinD, electrsd: &'a ElectrsD,
+) -> TestChainSource<'a> {
+	let r = rand::random_range(0..3);
+	match r {
+		0 => {
+			println!("Randomly setting up Esplora chain syncing...");
+			TestChainSource::Esplora(electrsd)
+		},
+		1 => {
+			println!("Randomly setting up Electrum chain syncing...");
+			TestChainSource::Electrum(electrsd)
+		},
+		2 => {
+			println!("Randomly setting up Bitcoind RPC chain syncing...");
+			TestChainSource::BitcoindRpcSync(bitcoind)
+		},
+		3 => {
+			println!("Randomly setting up Bitcoind REST chain syncing...");
+			TestChainSource::BitcoindRestSync(bitcoind)
+		},
+		_ => unreachable!(),
+	}
+}
+
 pub(crate) fn random_storage_path() -> PathBuf {
 	let mut temp_path = std::env::temp_dir();
 	let mut rng = rng();
@@ -292,6 +345,8 @@ pub(crate) struct TestConfig {
 	pub log_writer: TestLogWriter,
 	pub store_type: TestStoreType,
 	pub node_entropy: NodeEntropy,
+	pub async_payments_role: Option<AsyncPaymentsRole>,
+	pub recovery_mode: bool,
 }
 
 impl Default for TestConfig {
@@ -302,7 +357,16 @@ impl Default for TestConfig {
 
 		let mnemonic = generate_entropy_mnemonic(None);
 		let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
-		TestConfig { node_config, log_writer, store_type, node_entropy }
+		let async_payments_role = None;
+		let recovery_mode = false;
+		TestConfig {
+			node_config,
+			log_writer,
+			store_type,
+			node_entropy,
+			async_payments_role,
+			recovery_mode,
+		}
 	}
 }
 
@@ -359,23 +423,18 @@ pub(crate) fn setup_two_nodes_with_store(
 }
 
 pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> TestNode {
-	setup_node_for_async_payments(chain_source, config, None)
-}
-
-pub(crate) fn setup_node_for_async_payments(
-	chain_source: &TestChainSource, config: TestConfig,
-	async_payments_role: Option<AsyncPaymentsRole>,
-) -> TestNode {
 	setup_builder!(builder, config.node_config);
 	match chain_source {
 		TestChainSource::Esplora(electrsd) => {
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
-			let sync_config = EsploraSyncConfig { background_sync_config: None };
+			let mut sync_config = EsploraSyncConfig::default();
+			sync_config.background_sync_config = None;
 			builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		},
 		TestChainSource::Electrum(electrsd) => {
 			let electrum_url = format!("tcp://{}", electrsd.electrum_url);
-			let sync_config = ElectrumSyncConfig { background_sync_config: None };
+			let mut sync_config = ElectrumSyncConfig::default();
+			sync_config.background_sync_config = None;
 			builder.set_chain_source_electrum(electrum_url.clone(), Some(sync_config));
 		},
 		TestChainSource::BitcoindRpcSync(bitcoind) => {
@@ -417,7 +476,11 @@ pub(crate) fn setup_node_for_async_payments(
 		},
 	}
 
-	builder.set_async_payments_role(async_payments_role).unwrap();
+	builder.set_async_payments_role(config.async_payments_role).unwrap();
+
+	if config.recovery_mode {
+		builder.set_wallet_recovery_mode();
+	}
 
 	let node = match config.store_type {
 		TestStoreType::TestSyncStore => {
@@ -426,6 +489,10 @@ pub(crate) fn setup_node_for_async_payments(
 		},
 		TestStoreType::Sqlite => builder.build(config.node_entropy.into()).unwrap(),
 	};
+
+	if config.recovery_mode {
+		builder.set_wallet_recovery_mode();
+	}
 
 	node.start().unwrap();
 	assert!(node.status().is_running);

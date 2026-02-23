@@ -26,12 +26,22 @@ dictionary BackgroundSyncConfig {
 	u64 fee_rate_cache_update_interval_secs;
 };
 
+dictionary SyncTimeoutsConfig {
+	u64 onchain_wallet_sync_timeout_secs;
+	u64 lightning_wallet_sync_timeout_secs;
+	u64 fee_rate_cache_update_timeout_secs;
+	u64 tx_broadcast_timeout_secs;
+	u8 per_request_timeout_secs;
+};
+
 dictionary EsploraSyncConfig {
 	BackgroundSyncConfig? background_sync_config;
+	SyncTimeoutsConfig timeouts_config;
 };
 
 dictionary ElectrumSyncConfig {
 	BackgroundSyncConfig? background_sync_config;
+	SyncTimeoutsConfig timeouts_config;
 };
 
 dictionary LSPS2ServiceConfig {
@@ -119,6 +129,7 @@ interface Builder {
 	void set_node_alias(string node_alias);
 	[Throws=BuildError]
 	void set_async_payments_role(AsyncPaymentsRole? role);
+	void set_wallet_recovery_mode();
 	[Throws=BuildError]
 	Node build(NodeEntropy node_entropy);
 	[Throws=BuildError]
@@ -266,6 +277,8 @@ interface OnchainPayment {
 	Txid send_to_address([ByRef]Address address, u64 amount_sats, FeeRate? fee_rate);
 	[Throws=NodeError]
 	Txid send_all_to_address([ByRef]Address address, boolean retain_reserve, FeeRate? fee_rate);
+	[Throws=NodeError]
+	Txid bump_fee_rbf(PaymentId payment_id, FeeRate? fee_rate);
 };
 
 interface FeeRate {

@@ -32,6 +32,7 @@ use lightning::routing::scoring::{
 	ProbabilisticScoringFeeParameters,
 };
 use lightning::sign::{EntropySource, NodeSigner};
+use lightning::util::config::HTLCInterceptionFlags;
 use lightning::util::persist::{
 	KVStore, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 	CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -55,12 +56,14 @@ use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{
 	read_event_queue, read_external_pathfinding_scores_from_cache, read_network_graph,
-	read_node_metrics, read_output_sweeper, read_payments, read_peer_info, read_scorer,
-	write_node_metrics,
+	read_node_metrics, read_output_sweeper, read_payments, read_peer_info, read_pending_payments,
+	read_scorer, write_node_metrics,
 };
 use crate::io::vss_store::VssStoreBuilder;
 use crate::io::{
 	self, PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+	PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
@@ -73,8 +76,8 @@ use crate::runtime::{Runtime, RuntimeSpawner};
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreWrapper, GossipSync, Graph,
-	KeysManager, MessageRouter, OnionMessenger, PaymentStore, PeerManager, Persister,
-	SyncAndAsyncKVStore,
+	KeysManager, MessageRouter, OnionMessenger, PaymentStore, PeerManager, PendingPaymentStore,
+	Persister, SyncAndAsyncKVStore,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
@@ -241,6 +244,7 @@ pub struct NodeBuilder {
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
+	recovery_mode: bool,
 }
 
 impl NodeBuilder {
@@ -258,6 +262,7 @@ impl NodeBuilder {
 		let log_writer_config = None;
 		let runtime_handle = None;
 		let pathfinding_scores_sync_config = None;
+		let recovery_mode = false;
 		Self {
 			config,
 			chain_data_source_config,
@@ -267,6 +272,7 @@ impl NodeBuilder {
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
+			recovery_mode,
 		}
 	}
 
@@ -541,6 +547,16 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Configures the [`Node`] to resync chain data from genesis on first startup, recovering any
+	/// historical wallet funds.
+	///
+	/// This should only be set on first startup when importing an older wallet from a previously
+	/// used [`NodeEntropy`].
+	pub fn set_wallet_recovery_mode(&mut self) -> &mut Self {
+		self.recovery_mode = true;
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self, node_entropy: NodeEntropy) -> Result<Node, BuildError> {
@@ -676,6 +692,7 @@ impl NodeBuilder {
 			self.liquidity_source_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.async_payments_role,
+			self.recovery_mode,
 			seed_bytes,
 			runtime,
 			logger,
@@ -916,6 +933,15 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_async_payments_role(role).map(|_| ())
 	}
 
+	/// Configures the [`Node`] to resync chain data from genesis on first startup, recovering any
+	/// historical wallet funds.
+	///
+	/// This should only be set on first startup when importing an older wallet from a previously
+	/// used [`NodeEntropy`].
+	pub fn set_wallet_recovery_mode(&self) {
+		self.inner.write().unwrap().set_wallet_recovery_mode();
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self, node_entropy: Arc<NodeEntropy>) -> Result<Arc<Node>, BuildError> {
@@ -1030,8 +1056,8 @@ fn build_with_store_internal(
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
-	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
-	logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	async_payments_role: Option<AsyncPaymentsRole>, recovery_mode: bool, seed_bytes: [u8; 64],
+	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -1057,12 +1083,14 @@ fn build_with_store_internal(
 
 	let kv_store_ref = Arc::clone(&kv_store);
 	let logger_ref = Arc::clone(&logger);
-	let (payment_store_res, node_metris_res) = runtime.block_on(async move {
-		tokio::join!(
-			read_payments(&*kv_store_ref, Arc::clone(&logger_ref)),
-			read_node_metrics(&*kv_store_ref, Arc::clone(&logger_ref)),
-		)
-	});
+	let (payment_store_res, node_metris_res, pending_payment_store_res) =
+		runtime.block_on(async move {
+			tokio::join!(
+				read_payments(&*kv_store_ref, Arc::clone(&logger_ref)),
+				read_node_metrics(&*kv_store_ref, Arc::clone(&logger_ref)),
+				read_pending_payments(&*kv_store_ref, Arc::clone(&logger_ref))
+			)
+		});
 
 	// Initialize the status fields.
 	let node_metrics = match node_metris_res {
@@ -1225,21 +1253,39 @@ fn build_with_store_internal(
 					BuildError::WalletSetupFailed
 				})?;
 
-			if let Some(best_block) = chain_tip_opt {
-				// Insert the first checkpoint if we have it, to avoid resyncing from genesis.
-				// TODO: Use a proper wallet birthday once BDK supports it.
-				let mut latest_checkpoint = wallet.latest_checkpoint();
-				let block_id =
-					bdk_chain::BlockId { height: best_block.height, hash: best_block.block_hash };
-				latest_checkpoint = latest_checkpoint.insert(block_id);
-				let update =
-					bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
-				wallet.apply_update(update).map_err(|e| {
-					log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
-					BuildError::WalletSetupFailed
-				})?;
+			if !recovery_mode {
+				if let Some(best_block) = chain_tip_opt {
+					// Insert the first checkpoint if we have it, to avoid resyncing from genesis.
+					// TODO: Use a proper wallet birthday once BDK supports it.
+					let mut latest_checkpoint = wallet.latest_checkpoint();
+					let block_id = bdk_chain::BlockId {
+						height: best_block.height,
+						hash: best_block.block_hash,
+					};
+					latest_checkpoint = latest_checkpoint.insert(block_id);
+					let update =
+						bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
+					wallet.apply_update(update).map_err(|e| {
+						log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
+						BuildError::WalletSetupFailed
+					})?;
+				}
 			}
 			wallet
+		},
+	};
+
+	let pending_payment_store = match pending_payment_store_res {
+		Ok(pending_payments) => Arc::new(PendingPaymentStore::new(
+			pending_payments,
+			PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		)),
+		Err(e) => {
+			log_error!(logger, "Failed to read pending payment data from store: {}", e);
+			return Err(BuildError::ReadFailed);
 		},
 	};
 
@@ -1248,9 +1294,11 @@ fn build_with_store_internal(
 		wallet_persister,
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
+		Arc::clone(&chain_source),
 		Arc::clone(&payment_store),
 		Arc::clone(&config),
 		Arc::clone(&logger),
+		Arc::clone(&pending_payment_store),
 	));
 
 	// Initialize the KeysManager
@@ -1415,7 +1463,7 @@ fn build_with_store_internal(
 	if liquidity_source_config.and_then(|lsc| lsc.lsps2_service.as_ref()).is_some() {
 		// If we act as an LSPS2 service, we need to be able to intercept HTLCs and forward the
 		// information to the service handler.
-		user_config.accept_intercept_htlcs = true;
+		user_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs.into();
 
 		// If we act as an LSPS2 service, we allow forwarding to unannounced channels.
 		user_config.accept_forwards_to_priv_channels = true;

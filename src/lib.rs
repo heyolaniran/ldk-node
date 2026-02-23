@@ -1329,10 +1329,6 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})?;
 
-			// insert channel's funding utxo into the wallet so we can later calculate fees
-			// correctly when viewing this splice-in.
-			self.wallet.insert_txo(funding_txo.into_bitcoin_outpoint(), funding_output)?;
-
 			let change_address = self.wallet.get_new_internal_address()?;
 
 			let contribution = SpliceContribution::splice_in(
@@ -1425,18 +1421,6 @@ impl Node {
 					fee_estimator::get_fallback_rate_for_target(ConfirmationTarget::ChannelFunding)
 				},
 			};
-
-			let funding_txo = channel_details.funding_txo.ok_or_else(|| {
-				log_error!(self.logger, "Failed to splice channel: channel not yet ready",);
-				Error::ChannelSplicingFailed
-			})?;
-
-			let funding_output = channel_details.get_funding_output().ok_or_else(|| {
-				log_error!(self.logger, "Failed to splice channel: channel not yet ready");
-				Error::ChannelSplicingFailed
-			})?;
-
-			self.wallet.insert_txo(funding_txo.into_bitcoin_outpoint(), funding_output)?;
 
 			self.channel_manager
 				.splice_channel(
@@ -1856,7 +1840,7 @@ impl_writeable_tlv_based!(NodeMetrics, {
 	(6, latest_rgs_snapshot_timestamp, option),
 	(8, latest_node_announcement_broadcast_timestamp, option),
 	// 10 used to be latest_channel_monitor_archival_height
-	(10, _legacy_latest_channel_monitor_archival_height, (legacy, u32, |_: &NodeMetrics| None::<Option<u32>> )),
+	(10, _legacy_latest_channel_monitor_archival_height, (legacy, u32, |_| Ok(()), |_: &NodeMetrics| None::<Option<u32>> )),
 });
 
 pub(crate) fn total_anchor_channels_reserve_sats(

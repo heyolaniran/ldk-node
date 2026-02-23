@@ -12,7 +12,6 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::Transaction;
 use chrono::Utc;
@@ -1305,11 +1304,6 @@ where
 			htlc_minimum_msat: None,
 			htlc_maximum_msat: None,
 		}]);
-
-		let payment_hash = sha256::Hash::from_slice(&payment_hash.0).map_err(|e| {
-			log_error!(self.logger, "Invalid payment hash: {:?}", e);
-			Error::InvoiceCreationFailed
-		})?;
 
 		let currency = self.config.network.into();
 		let mut invoice_builder = InvoiceBuilder::new(currency)

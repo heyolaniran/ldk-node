@@ -14,8 +14,9 @@ use std::sync::{Arc, RwLock};
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, Retry, RetryableSendFailure,
+	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
 };
+use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
 use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
@@ -98,8 +99,8 @@ impl Bolt11Payment {
 		}
 
 		let invoice = maybe_deref(invoice);
-		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
-		let payment_id = PaymentId(invoice.payment_hash().to_byte_array());
+		let payment_hash = invoice.payment_hash();
+		let payment_id = PaymentId(invoice.payment_hash().0);
 		if let Some(payment) = self.payment_store.get(&payment_id) {
 			if payment.status == PaymentStatus::Pending
 				|| payment.status == PaymentStatus::Succeeded
@@ -109,17 +110,21 @@ impl Bolt11Payment {
 			}
 		}
 
-		let route_parameters =
+		let route_params_config =
 			route_parameters.or(self.config.route_parameters).unwrap_or_default();
 		let retry_strategy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
 		let payment_secret = Some(*invoice.payment_secret());
 
+		let optional_params = OptionalBolt11PaymentParams {
+			retry_strategy,
+			route_params_config,
+			..Default::default()
+		};
 		match self.channel_manager.pay_for_bolt11_invoice(
 			invoice,
 			payment_id,
 			None,
-			route_parameters,
-			retry_strategy,
+			optional_params,
 		) {
 			Ok(()) => {
 				let payee_pubkey = invoice.recover_payee_pub_key();
@@ -204,8 +209,8 @@ impl Bolt11Payment {
 			}
 		}
 
-		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
-		let payment_id = PaymentId(invoice.payment_hash().to_byte_array());
+		let payment_hash = invoice.payment_hash();
+		let payment_id = PaymentId(invoice.payment_hash().0);
 		if let Some(payment) = self.payment_store.get(&payment_id) {
 			if payment.status == PaymentStatus::Pending
 				|| payment.status == PaymentStatus::Succeeded
@@ -215,17 +220,21 @@ impl Bolt11Payment {
 			}
 		}
 
-		let route_parameters =
+		let route_params_config =
 			route_parameters.or(self.config.route_parameters).unwrap_or_default();
 		let retry_strategy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
 		let payment_secret = Some(*invoice.payment_secret());
 
+		let optional_params = OptionalBolt11PaymentParams {
+			retry_strategy,
+			route_params_config,
+			..Default::default()
+		};
 		match self.channel_manager.pay_for_bolt11_invoice(
 			invoice,
 			payment_id,
 			Some(amount_msat),
-			route_parameters,
-			retry_strategy,
+			optional_params,
 		) {
 			Ok(()) => {
 				let payee_pubkey = invoice.recover_payee_pub_key();
@@ -374,7 +383,7 @@ impl Bolt11Payment {
 			..PaymentDetailsUpdate::new(payment_id)
 		};
 
-		match self.payment_store.update(&update) {
+		match self.payment_store.update(update) {
 			Ok(DataStoreUpdateResult::Updated) | Ok(DataStoreUpdateResult::Unchanged) => (),
 			Ok(DataStoreUpdateResult::NotFound) => {
 				log_error!(
@@ -494,7 +503,7 @@ impl Bolt11Payment {
 			}
 		};
 
-		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_hash = invoice.payment_hash();
 		let payment_secret = invoice.payment_secret();
 		let id = PaymentId(payment_hash.0);
 		let preimage = if manual_claim_payment_hash.is_none() {
@@ -712,7 +721,7 @@ impl Bolt11Payment {
 			})?;
 
 		// Register payment in payment store.
-		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_hash = invoice.payment_hash();
 		let payment_secret = invoice.payment_secret();
 		let lsp_fee_limits = LSPFeeLimits {
 			max_total_opening_fee_msat: lsp_total_opening_fee,
