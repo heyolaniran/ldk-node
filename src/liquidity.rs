@@ -20,6 +20,7 @@ use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::types::ChannelId;
 use lightning::routing::router::{RouteHint, RouteHintHop};
+use lightning::sign::EntropySource;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, InvoiceBuilder, RoutingFees};
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::{LSPSDateTime, LSPSRequestId};
@@ -35,7 +36,6 @@ use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceCo
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 use lightning_types::payment::PaymentHash;
-use rand::Rng;
 use tokio::sync::oneshot;
 
 use crate::builder::BuildError;
@@ -99,6 +99,7 @@ struct LSPS2Service {
 ///
 /// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LSPS2ServiceConfig {
 	/// A token we may require to be sent by the clients.
 	///
@@ -641,7 +642,9 @@ where
 						return;
 					};
 
-					let user_channel_id: u128 = rand::rng().random();
+					let user_channel_id: u128 = u128::from_ne_bytes(
+						self.keys_manager.get_secure_random_bytes()[..16].try_into().unwrap(),
+					);
 					let intercept_scid = self.channel_manager.get_intercept_scid();
 
 					if let Some(payment_size_msat) = payment_size_msat {
@@ -1448,6 +1451,7 @@ pub(crate) struct LSPS2BuyResponse {
 /// [`Node::lsps1_liquidity`]: crate::Node::lsps1_liquidity
 /// [`Bolt11Payment::receive_via_jit_channel`]: crate::payment::Bolt11Payment::receive_via_jit_channel
 #[derive(Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct LSPS1Liquidity {
 	runtime: Arc<Runtime>,
 	wallet: Arc<Wallet>,
@@ -1464,7 +1468,10 @@ impl LSPS1Liquidity {
 	) -> Self {
 		Self { runtime, wallet, connection_manager, liquidity_source, logger }
 	}
+}
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl LSPS1Liquidity {
 	/// Connects to the configured LSP and places an order for an inbound channel.
 	///
 	/// The channel will be opened after one of the returned payment options has successfully been

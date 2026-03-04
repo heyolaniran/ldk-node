@@ -21,10 +21,10 @@ use common::{
 	expect_channel_pending_event, expect_channel_ready_event, expect_channel_ready_events,
 	expect_event, expect_payment_claimable_event, expect_payment_received_event,
 	expect_payment_successful_event, expect_splice_pending_event, generate_blocks_and_wait,
-	open_channel, open_channel_push_amt, premine_and_distribute_funds, premine_blocks, prepare_rbf,
-	random_chain_source, random_config, random_listening_addresses, setup_bitcoind_and_electrsd,
-	setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestStoreType,
-	TestSyncStore,
+	open_channel, open_channel_push_amt, open_channel_with_all, premine_and_distribute_funds,
+	premine_blocks, prepare_rbf, random_chain_source, random_config, random_listening_addresses,
+	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, splice_in_with_all,
+	wait_for_tx, TestChainSource, TestStoreType, TestSyncStore,
 };
 use ldk_node::config::{AsyncPaymentsRole, EsploraSyncConfig};
 use ldk_node::entropy::NodeEntropy;
@@ -984,7 +984,7 @@ async fn splice_channel() {
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
-	let expected_splice_in_fee_sat = 252;
+	let expected_splice_in_fee_sat = 255;
 
 	let payments = node_b.list_payments();
 	let payment =
@@ -1089,7 +1089,19 @@ async fn simple_bolt12_send_receive() {
 		.send(&offer, expected_quantity, expected_payer_note.clone(), None)
 		.unwrap();
 
-	expect_payment_successful_event!(node_a, Some(payment_id), None);
+	let event = node_a.next_event_async().await;
+	match event {
+		ref e @ Event::PaymentSuccessful { payment_id: ref evt_id, ref bolt12_invoice, .. } => {
+			println!("{} got event {:?}", node_a.node_id(), e);
+			assert_eq!(*evt_id, Some(payment_id));
+			assert!(
+				bolt12_invoice.is_some(),
+				"bolt12_invoice should be present for BOLT12 payments"
+			);
+			node_a.event_handled().unwrap();
+		},
+		ref e => panic!("{} got unexpected event!: {:?}", "node_a", e),
+	}
 	let node_a_payments =
 		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
 	assert_eq!(node_a_payments.len(), 1);
@@ -2473,7 +2485,7 @@ async fn persistence_backwards_compatibility() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn onchain_fee_bump_rbf() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let chain_source = TestChainSource::Esplora(&electrsd);
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
 
 	// Fund both nodes
@@ -2497,6 +2509,10 @@ async fn onchain_fee_bump_rbf() {
 	let txid =
 		node_b.onchain_payment().send_to_address(&addr_a, amount_to_send_sats, None).unwrap();
 	wait_for_tx(&electrsd.client, txid).await;
+	// Give the chain source time to index the unconfirmed transaction before syncing.
+	// Without this, Esplora may not yet have the tx, causing sync to miss it and
+	// leaving the BDK wallet graph empty.
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -2522,10 +2538,10 @@ async fn onchain_fee_bump_rbf() {
 	// Successful fee bump
 	let new_txid = node_b.onchain_payment().bump_fee_rbf(payment_id, None).unwrap();
 	wait_for_tx(&electrsd.client, new_txid).await;
-
-	// Sleep to allow for transaction propagation
+	// Give the chain source time to index the unconfirmed transaction before syncing.
+	// Without this, Esplora may not yet have the tx, causing sync to miss it and
+	// leaving the BDK wallet graph empty.
 	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -2547,26 +2563,9 @@ async fn onchain_fee_bump_rbf() {
 		_ => panic!("Unexpected payment kind"),
 	}
 
-	// Verify node_a has the inbound payment txid updated to the replacement txid
-	let node_a_inbound_payment = node_a.payment(&payment_id).unwrap();
-	assert_eq!(node_a_inbound_payment.direction, PaymentDirection::Inbound);
-	match &node_a_inbound_payment.kind {
-		PaymentKind::Onchain { txid: inbound_txid, .. } => {
-			assert_eq!(
-				*inbound_txid, new_txid,
-				"node_a inbound payment txid should be updated to the replacement txid"
-			);
-		},
-		_ => panic!("Unexpected payment kind"),
-	}
-
 	// Multiple consecutive bumps
 	let second_bump_txid = node_b.onchain_payment().bump_fee_rbf(payment_id, None).unwrap();
 	wait_for_tx(&electrsd.client, second_bump_txid).await;
-
-	// Sleep to allow for transaction propagation
-	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -2581,19 +2580,6 @@ async fn onchain_fee_bump_rbf() {
 			assert_eq!(
 				*txid, second_bump_txid,
 				"node_b payment txid should be updated to the second replacement txid"
-			);
-		},
-		_ => panic!("Unexpected payment kind"),
-	}
-
-	// Verify node_a has the inbound payment txid updated to the second replacement txid
-	let node_a_second_inbound_payment = node_a.payment(&payment_id).unwrap();
-	assert_eq!(node_a_second_inbound_payment.direction, PaymentDirection::Inbound);
-	match &node_a_second_inbound_payment.kind {
-		PaymentKind::Onchain { txid: inbound_txid, .. } => {
-			assert_eq!(
-				*inbound_txid, second_bump_txid,
-				"node_a inbound payment txid should be updated to the second replacement txid"
 			);
 		},
 		_ => panic!("Unexpected payment kind"),
@@ -2620,10 +2606,202 @@ async fn onchain_fee_bump_rbf() {
 	}
 
 	// Verify node A received the funds correctly
-	let node_a_received_payment = node_a.list_payments_with_filter(
-		|p| matches!(p.kind, PaymentKind::Onchain { txid, .. } if txid == second_bump_txid),
-	);
+	let node_a_received_payment = node_a.list_payments_with_filter(|p| {
+		p.id == payment_id && matches!(p.kind, PaymentKind::Onchain { .. })
+	});
+
 	assert_eq!(node_a_received_payment.len(), 1);
+	match &node_a_received_payment[0].kind {
+		PaymentKind::Onchain { txid: inbound_txid, .. } => {
+			assert_eq!(
+				*inbound_txid, second_bump_txid,
+				"node_a inbound payment txid should be updated to the second replacement txid"
+			);
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
 	assert_eq!(node_a_received_payment[0].amount_msat, Some(amount_to_send_sats * 1000));
 	assert_eq!(node_a_received_payment[0].status, PaymentStatus::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn open_channel_with_all_with_anchors() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 1_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+
+	let funding_txo = open_channel_with_all(&node_a, &node_b, false, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let _user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// After opening a channel with all balance, the remaining on-chain balance should only
+	// be the anchor reserve (25k sats by default) plus a small margin for change
+	let anchor_reserve_sat = 25_000;
+	let remaining_balance = node_a.list_balances().spendable_onchain_balance_sats;
+	assert!(
+		remaining_balance < anchor_reserve_sat + 500,
+		"Remaining balance {remaining_balance} should be close to the anchor reserve {anchor_reserve_sat}"
+	);
+
+	// Verify a channel was opened with most of the funds
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1);
+	let channel = &channels[0];
+	assert!(channel.channel_value_sats > premine_amount_sat - anchor_reserve_sat - 500);
+	assert_eq!(channel.counterparty_node_id, node_b.node_id());
+	assert_eq!(channel.funding_txo.unwrap(), funding_txo);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn open_channel_with_all_without_anchors() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false, false);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 1_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+
+	let funding_txo = open_channel_with_all(&node_a, &node_b, false, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let _user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Without anchors, there should be no remaining balance
+	let remaining_balance = node_a.list_balances().spendable_onchain_balance_sats;
+	assert_eq!(
+		remaining_balance, 0,
+		"Remaining balance {remaining_balance} should be zero without anchor reserve"
+	);
+
+	// Verify a channel was opened with all the funds accounting for fees
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1);
+	let channel = &channels[0];
+	assert!(channel.channel_value_sats > premine_amount_sat - 500);
+	assert_eq!(channel.counterparty_node_id, node_b.node_id());
+	assert_eq!(channel.funding_txo.unwrap(), funding_txo);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_in_with_all_balance() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 5_000_000;
+	let channel_amount_sat = 1_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+
+	// Open a channel with a fixed amount first
+	let funding_txo = open_channel(&node_a, &node_b, channel_amount_sat, false, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1);
+	assert_eq!(channels[0].channel_value_sats, channel_amount_sat);
+	assert_eq!(channels[0].funding_txo.unwrap(), funding_txo);
+
+	let balance_before_splice = node_a.list_balances().spendable_onchain_balance_sats;
+	assert!(balance_before_splice > 0);
+
+	// Splice in with all remaining on-chain funds
+	splice_in_with_all(&node_a, &node_b, &user_channel_id_a, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let _user_channel_id_a2 = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b2 = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// After splicing with all balance, channel value should be close to the premined amount
+	// minus fees and anchor reserve
+	let anchor_reserve_sat = 25_000;
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1);
+	let channel = &channels[0];
+	assert!(
+		channel.channel_value_sats > premine_amount_sat - anchor_reserve_sat - 1000,
+		"Channel value {} should be close to premined amount {} minus anchor reserve {} and fees",
+		channel.channel_value_sats,
+		premine_amount_sat,
+		anchor_reserve_sat,
+	);
+
+	// Remaining on-chain balance should be close to just the anchor reserve
+	let remaining_balance = node_a.list_balances().spendable_onchain_balance_sats;
+	assert!(
+		remaining_balance < anchor_reserve_sat + 500,
+		"Remaining balance {remaining_balance} should be close to the anchor reserve {anchor_reserve_sat}"
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
 }

@@ -39,7 +39,7 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
-use lightning_persister::fs_store::FilesystemStore;
+use lightning_persister::fs_store::v1::FilesystemStore;
 use vss_client::headers::VssHeaderProvider;
 
 use crate::chain::ChainSource;
@@ -68,6 +68,7 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
+use crate::lnurl_auth::LnurlAuth;
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -154,6 +155,7 @@ impl std::fmt::Debug for LogWriterConfig {
 ///
 /// [`Node`]: crate::Node
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 pub enum BuildError {
 	/// The current system time is invalid, clocks might have gone backwards.
 	InvalidSystemTime,
@@ -587,11 +589,47 @@ impl NodeBuilder {
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
 	/// previously configured.
 	///
+	/// Uses a simple authentication scheme proving knowledge of a secret key.
+	///
+	/// `fixed_headers` are included as it is in all the requests made to VSS.
+	///
+	/// `store_id` allows you to segment LDK Node storage from other storage accessed with
+	/// [`VssStoreBuilder`] using the same [`NodeEntropy`] (as storage with different keys is
+	/// obviously segmented to prevent wallets from reading data for unrelated wallets). It can be
+	/// any value.
+	///
+	/// **Caution**: VSS support is in **alpha** and is considered experimental.
+	/// Using VSS (or any remote persistence) may cause LDK to panic if persistence failures are
+	/// unrecoverable, i.e., if they remain unresolved after internal retries are exhausted.
+	///
+	/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
+	pub fn build_with_vss_store(
+		&self, node_entropy: NodeEntropy, vss_url: String, store_id: String,
+		fixed_headers: HashMap<String, String>,
+	) -> Result<Node, BuildError> {
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let builder = VssStoreBuilder::new(node_entropy, vss_url, store_id, self.config.network);
+		let vss_store = builder.build_with_sigs_auth(fixed_headers).map_err(|e| {
+			log_error!(logger, "Failed to setup VSS store: {}", e);
+			BuildError::KVStoreSetupFailed
+		})?;
+
+		self.build_with_store(node_entropy, vss_store)
+	}
+
+	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
+	/// previously configured.
+	///
 	/// Uses [LNURL-auth] based authentication scheme as default method for authentication/authorization.
 	///
 	/// The LNURL challenge will be retrieved by making a request to the given `lnurl_auth_server_url`.
 	/// The returned JWT token in response to the signed LNURL request, will be used for
 	/// authentication/authorization of all the requests made to VSS.
+	///
+	/// `store_id` allows you to segment LDK Node storage from other storage accessed with
+	/// [`VssStoreBuilder`] using the same authentication (as storage with different keys is
+	/// obviously segmented to prevent wallets from reading data for unrelated wallets). It can be
+	/// any value.
 	///
 	/// `fixed_headers` are included as it is in all the requests made to VSS and LNURL auth server.
 	///
@@ -601,16 +639,17 @@ impl NodeBuilder {
 	///
 	/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
-	pub fn build_with_vss_store(
+	pub fn build_with_vss_store_and_lnurl_auth(
 		&self, node_entropy: NodeEntropy, vss_url: String, store_id: String,
 		lnurl_auth_server_url: String, fixed_headers: HashMap<String, String>,
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 		let builder = VssStoreBuilder::new(node_entropy, vss_url, store_id, self.config.network);
-		let vss_store = builder.build(lnurl_auth_server_url, fixed_headers).map_err(|e| {
-			log_error!(logger, "Failed to setup VSS store: {}", e);
-			BuildError::KVStoreSetupFailed
-		})?;
+		let vss_store =
+			builder.build_with_lnurl(lnurl_auth_server_url, fixed_headers).map_err(|e| {
+				log_error!(logger, "Failed to setup VSS store: {}", e);
+				BuildError::KVStoreSetupFailed
+			})?;
 
 		self.build_with_store(node_entropy, vss_store)
 	}
@@ -959,6 +998,34 @@ impl ArcedNodeBuilder {
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
 	/// previously configured.
 	///
+	/// Uses a simple authentication scheme proving knowledge of a secret key.
+	///
+	/// `fixed_headers` are included as it is in all the requests made to VSS and LNURL auth server.
+	///
+	/// `store_id` allows you to segment LDK Node storage from other storage accessed with
+	/// [`VssStoreBuilder`] using the same [`NodeEntropy`] (as storage with different keys is
+	/// obviously segmented to prevent wallets from reading data for unrelated wallets). It can be
+	/// any value.
+	///
+	/// **Caution**: VSS support is in **alpha** and is considered experimental.
+	/// Using VSS (or any remote persistence) may cause LDK to panic if persistence failures are
+	/// unrecoverable, i.e., if they remain unresolved after internal retries are exhausted.
+	///
+	/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
+	pub fn build_with_vss_store(
+		&self, node_entropy: Arc<NodeEntropy>, vss_url: String, store_id: String,
+		fixed_headers: HashMap<String, String>,
+	) -> Result<Arc<Node>, BuildError> {
+		self.inner
+			.read()
+			.unwrap()
+			.build_with_vss_store(*node_entropy, vss_url, store_id, fixed_headers)
+			.map(Arc::new)
+	}
+
+	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
+	/// previously configured.
+	///
 	/// Uses [LNURL-auth] based authentication scheme as default method for authentication/authorization.
 	///
 	/// The LNURL challenge will be retrieved by making a request to the given `lnurl_auth_server_url`.
@@ -967,20 +1034,25 @@ impl ArcedNodeBuilder {
 	///
 	/// `fixed_headers` are included as it is in all the requests made to VSS and LNURL auth server.
 	///
+	/// `store_id` allows you to segment LDK Node storage from other storage accessed with
+	/// [`VssStoreBuilder`] using the same authentication (as storage with different keys is
+	/// obviously segmented to prevent wallets from reading data for unrelated wallets). It can be
+	/// any value.
+	///
 	/// **Caution**: VSS support is in **alpha** and is considered experimental.
 	/// Using VSS (or any remote persistence) may cause LDK to panic if persistence failures are
 	/// unrecoverable, i.e., if they remain unresolved after internal retries are exhausted.
 	///
 	/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
-	pub fn build_with_vss_store(
+	pub fn build_with_vss_store_and_lnurl_auth(
 		&self, node_entropy: Arc<NodeEntropy>, vss_url: String, store_id: String,
 		lnurl_auth_server_url: String, fixed_headers: HashMap<String, String>,
 	) -> Result<Arc<Node>, BuildError> {
 		self.inner
 			.read()
 			.unwrap()
-			.build_with_vss_store(
+			.build_with_vss_store_and_lnurl_auth(
 				*node_entropy,
 				vss_url,
 				store_id,
@@ -1026,17 +1098,13 @@ impl ArcedNodeBuilder {
 	/// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
 	pub fn build_with_vss_store_and_header_provider(
 		&self, node_entropy: Arc<NodeEntropy>, vss_url: String, store_id: String,
-		header_provider: Arc<dyn VssHeaderProvider>,
+		header_provider: Arc<dyn crate::ffi::VssHeaderProvider>,
 	) -> Result<Arc<Node>, BuildError> {
+		let adapter = Arc::new(crate::ffi::VssHeaderProviderAdapter::new(header_provider));
 		self.inner
 			.read()
 			.unwrap()
-			.build_with_vss_store_and_header_provider(
-				*node_entropy,
-				vss_url,
-				store_id,
-				header_provider,
-			)
+			.build_with_vss_store_and_header_provider(*node_entropy, vss_url, store_id, adapter)
 			.map(Arc::new)
 	}
 
@@ -1765,6 +1833,8 @@ fn build_with_store_internal(
 		None
 	};
 
+	let lnurl_auth = Arc::new(LnurlAuth::new(xprv, Arc::clone(&logger)));
+
 	let (stop_sender, _) = tokio::sync::watch::channel(());
 	let (background_processor_stop_sender, _) = tokio::sync::watch::channel(());
 	let is_running = Arc::new(RwLock::new(false));
@@ -1810,6 +1880,7 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
+		lnurl_auth,
 		is_running,
 		node_metrics,
 		om_mailbox,

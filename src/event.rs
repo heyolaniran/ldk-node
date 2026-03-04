@@ -15,13 +15,17 @@ use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
 use lightning::events::bump_transaction::BumpTransactionEvent;
+#[cfg(not(feature = "uniffi"))]
+use lightning::events::PaidBolt12Invoice;
 use lightning::events::{
-	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
+	ClosureReason, Event as LdkEvent, FundingInfo, PaymentFailureReason, PaymentPurpose,
+	ReplayEvent,
 };
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
+use lightning::sign::EntropySource;
 use lightning::util::config::{
 	ChannelConfigOverrides, ChannelConfigUpdate, ChannelHandshakeConfigUpdate,
 };
@@ -30,12 +34,13 @@ use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
-use rand::{rng, Rng};
 
 use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
+#[cfg(feature = "uniffi")]
+use crate::ffi::PaidBolt12Invoice;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -48,7 +53,9 @@ use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
 use crate::runtime::Runtime;
-use crate::types::{CustomTlvRecord, DynStore, OnionMessenger, PaymentStore, Sweeper, Wallet};
+use crate::types::{
+	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper, Wallet,
+};
 use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
 	UserChannelId,
@@ -58,6 +65,7 @@ use crate::{
 ///
 /// [`Node`]: [`crate::Node`]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Event {
 	/// A sent payment was successful.
 	PaymentSuccessful {
@@ -75,6 +83,17 @@ pub enum Event {
 		payment_preimage: Option<PaymentPreimage>,
 		/// The total fee which was spent at intermediate hops in this payment.
 		fee_paid_msat: Option<u64>,
+		/// The BOLT12 invoice that was paid.
+		///
+		/// This is useful for proof of payment. A third party can verify that the payment was made
+		/// by checking that the `payment_hash` in the invoice matches `sha256(payment_preimage)`.
+		///
+		/// Will be `None` for non-BOLT12 payments.
+		///
+		/// Note that static invoices (indicated by [`PaidBolt12Invoice::StaticInvoice`], used for
+		/// async payments) do not support proof of payment as the payment hash is not derived
+		/// from a preimage known only to the recipient.
+		bolt12_invoice: Option<PaidBolt12Invoice>,
 	},
 	/// A sent payment has failed.
 	PaymentFailed {
@@ -264,6 +283,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(1, fee_paid_msat, option),
 		(3, payment_id, option),
 		(5, payment_preimage, option),
+		(7, bolt12_invoice, option),
 	},
 	(1, PaymentFailed) => {
 		(0, payment_hash, option),
@@ -488,6 +508,7 @@ where
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
+	keys_manager: Arc<KeysManager>,
 	runtime: Arc<Runtime>,
 	logger: L,
 	config: Arc<Config>,
@@ -507,9 +528,9 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
-		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
-		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
-		config: Arc<Config>,
+		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
+		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
+		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -522,6 +543,7 @@ where
 			liquidity_source,
 			payment_store,
 			peer_store,
+			keys_manager,
 			logger,
 			runtime,
 			config,
@@ -1022,6 +1044,7 @@ where
 				payment_preimage,
 				payment_hash,
 				fee_paid_msat,
+				bolt12_invoice,
 				..
 			} => {
 				let payment_id = if let Some(id) = payment_id {
@@ -1067,6 +1090,7 @@ where
 					payment_hash,
 					payment_preimage: Some(payment_preimage),
 					fee_paid_msat,
+					bolt12_invoice: bolt12_invoice.map(Into::into),
 				};
 
 				match self.event_queue.add_event(event).await {
@@ -1158,52 +1182,45 @@ where
 				}
 
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
-				if anchor_channel {
-					if let Some(anchor_channels_config) =
-						self.config.anchor_channels_config.as_ref()
-					{
-						let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
-							&self.channel_manager,
-							&self.config,
-						);
-						let spendable_amount_sats = self
-							.wallet
-							.get_spendable_amount_sats(cur_anchor_reserve_sats)
-							.unwrap_or(0);
+				if anchor_channel && self.config.anchor_channels_config.is_none() {
+					log_error!(
+						self.logger,
+						"Rejecting inbound channel from peer {} due to Anchor channels being disabled.",
+						counterparty_node_id,
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Channel request rejected".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject channel: {:?}", e)
+						});
+					return Ok(());
+				}
 
-						let required_amount_sats = if anchor_channels_config
-							.trusted_peers_no_reserve
-							.contains(&counterparty_node_id)
-						{
-							0
-						} else {
-							anchor_channels_config.per_channel_reserve_sats
-						};
+				let required_reserve_sats = crate::new_channel_anchor_reserve_sats(
+					&self.config,
+					&counterparty_node_id,
+					anchor_channel,
+				);
 
-						if spendable_amount_sats < required_amount_sats {
-							log_error!(
-								self.logger,
-								"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: {}/{}sats",
-								counterparty_node_id,
-								spendable_amount_sats,
-								required_amount_sats,
-							);
-							self.channel_manager
-								.force_close_broadcasting_latest_txn(
-									&temporary_channel_id,
-									&counterparty_node_id,
-									"Channel request rejected".to_string(),
-								)
-								.unwrap_or_else(|e| {
-									log_error!(self.logger, "Failed to reject channel: {:?}", e)
-								});
-							return Ok(());
-						}
-					} else {
+				if required_reserve_sats > 0 {
+					let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
+						&self.channel_manager,
+						&self.config,
+					);
+					let spendable_amount_sats =
+						self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+
+					if spendable_amount_sats < required_reserve_sats {
 						log_error!(
 							self.logger,
-							"Rejecting inbound channel from peer {} due to Anchor channels being disabled.",
+							"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: {}/{}sats",
 							counterparty_node_id,
+							spendable_amount_sats,
+							required_reserve_sats,
 						);
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
@@ -1218,7 +1235,9 @@ where
 					}
 				}
 
-				let user_channel_id: u128 = rng().random();
+				let user_channel_id: u128 = u128::from_ne_bytes(
+					self.keys_manager.get_secure_random_bytes()[..16].try_into().unwrap(),
+				);
 				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
 				if let Some((lsp_node_id, _)) = self
@@ -1511,7 +1530,26 @@ where
 					},
 				};
 			},
-			LdkEvent::DiscardFunding { .. } => {},
+			LdkEvent::DiscardFunding { channel_id, funding_info } => {
+				if let FundingInfo::Contribution { inputs: _, outputs } = funding_info {
+					log_info!(
+						self.logger,
+						"Reclaiming unused addresses from channel {} funding",
+						channel_id,
+					);
+
+					let tx = bitcoin::Transaction {
+						version: bitcoin::transaction::Version::TWO,
+						lock_time: bitcoin::absolute::LockTime::ZERO,
+						input: vec![],
+						output: outputs,
+					};
+					if let Err(e) = self.wallet.cancel_tx(&tx) {
+						log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
+						return Err(ReplayEvent());
+					}
+				}
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,
@@ -1741,7 +1779,6 @@ where
 				user_channel_id,
 				counterparty_node_id,
 				abandoned_funding_txo,
-				contributed_outputs,
 				..
 			} => {
 				if let Some(funding_txo) = abandoned_funding_txo {
@@ -1759,17 +1796,6 @@ where
 						channel_id,
 						counterparty_node_id,
 					);
-				}
-
-				let tx = bitcoin::Transaction {
-					version: bitcoin::transaction::Version::TWO,
-					lock_time: bitcoin::absolute::LockTime::ZERO,
-					input: vec![],
-					output: contributed_outputs,
-				};
-				if let Err(e) = self.wallet.cancel_tx(&tx) {
-					log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
-					return Err(ReplayEvent());
 				}
 
 				let event = Event::SpliceFailed {

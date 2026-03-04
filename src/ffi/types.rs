@@ -10,6 +10,7 @@
 //
 // Make sure to add any re-exported items that need to be used in uniffi below.
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -22,17 +23,20 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 pub use bitcoin::{Address, BlockHash, FeeRate, Network, OutPoint, ScriptBuf, Txid};
 pub use lightning::chain::channelmonitor::BalanceSource;
+use lightning::events::PaidBolt12Invoice as LdkPaidBolt12Invoice;
 pub use lightning::events::{ClosureReason, PaymentFailureReason};
 use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::msgs::DecodeError;
 pub use lightning::ln::types::ChannelId;
 use lightning::offers::invoice::Bolt12Invoice as LdkBolt12Invoice;
 pub use lightning::offers::offer::OfferId;
 use lightning::offers::offer::{Amount as LdkAmount, Offer as LdkOffer};
 use lightning::offers::refund::Refund as LdkRefund;
+use lightning::offers::static_invoice::StaticInvoice as LdkStaticInvoice;
 use lightning::onion_message::dns_resolution::HumanReadableName as LdkHumanReadableName;
 pub use lightning::routing::gossip::{NodeAlias, NodeId, RoutingFees};
 pub use lightning::routing::router::RouteParametersConfig;
-use lightning::util::ser::Writeable;
+use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning_invoice::{Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescriptionRef};
 pub use lightning_invoice::{Description, SignedRawBolt11Invoice};
 pub use lightning_liquidity::lsps0::ser::LSPSDateTime;
@@ -41,89 +45,167 @@ pub use lightning_liquidity::lsps1::msgs::{
 };
 pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 pub use lightning_types::string::UntrustedString;
-pub use vss_client::headers::{VssHeaderProvider, VssHeaderProviderError};
+use vss_client::headers::{
+	VssHeaderProvider as VssClientHeaderProvider,
+	VssHeaderProviderError as VssClientHeaderProviderError,
+};
+
+/// Errors around providing headers for each VSS request.
+#[derive(Debug, uniffi::Error)]
+pub enum VssHeaderProviderError {
+	/// Invalid data was encountered.
+	InvalidData {
+		/// The error message.
+		error: String,
+	},
+	/// An external request failed.
+	RequestError {
+		/// The error message.
+		error: String,
+	},
+	/// Authorization was refused.
+	AuthorizationError {
+		/// The error message.
+		error: String,
+	},
+	/// An application-level error occurred specific to the header provider functionality.
+	InternalError {
+		/// The error message.
+		error: String,
+	},
+}
+
+impl std::fmt::Display for VssHeaderProviderError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::InvalidData { error } => write!(f, "invalid data: {}", error),
+			Self::RequestError { error } => {
+				write!(f, "error performing external request: {}", error)
+			},
+			Self::AuthorizationError { error } => {
+				write!(f, "authorization was refused: {}", error)
+			},
+			Self::InternalError { error } => write!(f, "internal error: {}", error),
+		}
+	}
+}
+
+impl std::error::Error for VssHeaderProviderError {}
+
+impl From<VssHeaderProviderError> for VssClientHeaderProviderError {
+	fn from(e: VssHeaderProviderError) -> Self {
+		match e {
+			VssHeaderProviderError::InvalidData { error } => {
+				VssClientHeaderProviderError::InvalidData { error }
+			},
+			VssHeaderProviderError::RequestError { error } => {
+				VssClientHeaderProviderError::RequestError { error }
+			},
+			VssHeaderProviderError::AuthorizationError { error } => {
+				VssClientHeaderProviderError::AuthorizationError { error }
+			},
+			VssHeaderProviderError::InternalError { error } => {
+				VssClientHeaderProviderError::InternalError { error }
+			},
+		}
+	}
+}
+
+/// Defines a trait around how headers are provided for each VSS request.
+#[async_trait::async_trait]
+pub trait VssHeaderProvider: Send + Sync {
+	/// Returns the HTTP headers to be used for a VSS request.
+	async fn get_headers(
+		&self, request: Vec<u8>,
+	) -> Result<HashMap<String, String>, VssHeaderProviderError>;
+}
+
+/// An adapter that wraps the local [`VssHeaderProvider`] and implements the upstream
+/// [`VssClientHeaderProvider`] trait.
+pub(crate) struct VssHeaderProviderAdapter {
+	inner: Arc<dyn VssHeaderProvider>,
+}
+
+impl VssHeaderProviderAdapter {
+	pub(crate) fn new(inner: Arc<dyn VssHeaderProvider>) -> Self {
+		Self { inner }
+	}
+}
+
+#[async_trait::async_trait]
+impl VssClientHeaderProvider for VssHeaderProviderAdapter {
+	async fn get_headers(
+		&self, request: &[u8],
+	) -> Result<HashMap<String, String>, VssClientHeaderProviderError> {
+		self.inner.get_headers(request.to_vec()).await.map_err(Into::into)
+	}
+}
 
 use crate::builder::sanitize_alias;
-pub use crate::config::{
-	default_config, AnchorChannelsConfig, BackgroundSyncConfig, ElectrumSyncConfig,
-	EsploraSyncConfig, MaxDustHTLCExposure, SyncTimeoutsConfig,
-};
-pub use crate::entropy::{generate_entropy_mnemonic, EntropyError, NodeEntropy, WordCount};
+pub use crate::config::{default_config, ElectrumSyncConfig, EsploraSyncConfig};
+pub use crate::entropy::{generate_entropy_mnemonic, NodeEntropy, WordCount};
 use crate::error::Error;
-pub use crate::graph::{ChannelInfo, ChannelUpdateInfo, NodeAnnouncementInfo, NodeInfo};
-pub use crate::liquidity::{LSPS1OrderStatus, LSPS2ServiceConfig};
+pub use crate::liquidity::LSPS1OrderStatus;
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
-pub use crate::payment::store::{
-	ConfirmationStatus, LSPFeeLimits, PaymentDirection, PaymentKind, PaymentStatus,
-};
-pub use crate::payment::UnifiedPaymentResult;
-use crate::{hex_utils, SocketAddress, UniffiCustomTypeConverter, UserChannelId};
+use crate::{hex_utils, SocketAddress, UserChannelId};
 
-impl UniffiCustomTypeConverter for PublicKey {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(PublicKey, String, {
+	remote,
+	try_lift: |val| {
 		if let Ok(key) = PublicKey::from_str(&val) {
 			return Ok(key);
 		}
 
 		Err(Error::InvalidPublicKey.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for NodeId {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(NodeId, String, {
+	remote,
+	try_lift: |val| {
 		if let Ok(key) = NodeId::from_str(&val) {
 			return Ok(key);
 		}
 
 		Err(Error::InvalidNodeId.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for Address {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(Address, String, {
+	remote,
+	try_lift: |val| {
 		if let Ok(addr) = Address::from_str(&val) {
 			return Ok(addr.assume_checked());
 		}
 
 		Err(Error::InvalidAddress.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for ScriptBuf {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(ScriptBuf, String, {
+	remote,
+	try_lift: |val| {
 		if let Ok(key) = ScriptBuf::from_hex(&val) {
 			return Ok(key);
 		}
 
 		Err(Error::InvalidScriptPubKey.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum OfferAmount {
 	Bitcoin { amount_msats: u64 },
 	Currency { iso4217_code: String, amount: u64 },
@@ -154,12 +236,15 @@ impl From<LdkAmount> for OfferAmount {
 /// [`InvoiceRequest`]: lightning::offers::invoice_request::InvoiceRequest
 /// [`Bolt12Invoice`]: lightning::offers::invoice::Bolt12Invoice
 /// [`Offer`]: lightning::offers::Offer:amount
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
 pub struct Offer {
 	pub(crate) inner: LdkOffer,
 }
 
+#[uniffi::export]
 impl Offer {
+	#[uniffi::constructor]
 	pub fn from_str(offer_str: &str) -> Result<Self, Error> {
 		offer_str.parse()
 	}
@@ -297,15 +382,18 @@ impl std::fmt::Display for Offer {
 /// This struct can also be used for LN-Address recipients.
 ///
 /// [Homograph Attacks]: https://en.wikipedia.org/wiki/IDN_homograph_attack
+#[derive(uniffi::Object)]
 pub struct HumanReadableName {
 	pub(crate) inner: LdkHumanReadableName,
 }
 
+#[uniffi::export]
 impl HumanReadableName {
 	/// Constructs a new [`HumanReadableName`] from the standard encoding - `user`@`domain`.
 	///
 	/// If `user` includes the standard BIP 353 ₿ prefix it is automatically removed as required by
 	/// BIP 353.
+	#[uniffi::constructor]
 	pub fn from_encoded(encoded: &str) -> Result<Self, Error> {
 		let hrn = match LdkHumanReadableName::from_encoded(encoded) {
 			Ok(hrn) => Ok(hrn),
@@ -359,12 +447,15 @@ impl AsRef<LdkHumanReadableName> for HumanReadableName {
 ///
 /// [`Bolt12Invoice`]: lightning::offers::invoice::Bolt12Invoice
 /// [`Offer`]: lightning::offers::offer::Offer
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
 pub struct Refund {
 	pub(crate) inner: LdkRefund,
 }
 
+#[uniffi::export]
 impl Refund {
+	#[uniffi::constructor]
 	pub fn from_str(refund_str: &str) -> Result<Self, Error> {
 		refund_str.parse()
 	}
@@ -471,12 +562,14 @@ impl std::fmt::Display for Refund {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
 pub struct Bolt12Invoice {
 	pub(crate) inner: LdkBolt12Invoice,
 }
 
+#[uniffi::export]
 impl Bolt12Invoice {
+	#[uniffi::constructor]
 	pub fn from_str(invoice_str: &str) -> Result<Self, Error> {
 		invoice_str.parse()
 	}
@@ -686,10 +779,98 @@ impl AsRef<LdkBolt12Invoice> for Bolt12Invoice {
 	}
 }
 
-impl UniffiCustomTypeConverter for OfferId {
-	type Builtin = String;
+/// A static invoice used for async payments.
+///
+/// Static invoices are a special type of BOLT12 invoice where proof of payment is not possible,
+/// as the payment hash is not derived from a preimage known only to the recipient.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+pub struct StaticInvoice {
+	pub(crate) inner: LdkStaticInvoice,
+}
 
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+#[uniffi::export]
+impl StaticInvoice {
+	/// The amount for a successful payment of the invoice, if specified.
+	pub fn amount(&self) -> Option<OfferAmount> {
+		self.inner.amount().map(|amount| amount.into())
+	}
+}
+
+impl From<LdkStaticInvoice> for StaticInvoice {
+	fn from(invoice: LdkStaticInvoice) -> Self {
+		StaticInvoice { inner: invoice }
+	}
+}
+
+impl Deref for StaticInvoice {
+	type Target = LdkStaticInvoice;
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl AsRef<LdkStaticInvoice> for StaticInvoice {
+	fn as_ref(&self) -> &LdkStaticInvoice {
+		self.deref()
+	}
+}
+
+/// The BOLT12 invoice that was paid, surfaced in [`Event::PaymentSuccessful`].
+///
+/// [`Event::PaymentSuccessful`]: crate::Event::PaymentSuccessful
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PaidBolt12Invoice {
+	/// The BOLT12 invoice, allowing the user to perform proof of payment.
+	Bolt12(Arc<Bolt12Invoice>),
+	/// The static invoice, used in async payments, where the user cannot perform proof of
+	/// payment.
+	Static(Arc<StaticInvoice>),
+}
+
+impl From<LdkPaidBolt12Invoice> for PaidBolt12Invoice {
+	fn from(ldk: LdkPaidBolt12Invoice) -> Self {
+		match ldk {
+			LdkPaidBolt12Invoice::Bolt12Invoice(invoice) => {
+				PaidBolt12Invoice::Bolt12(Arc::new(Bolt12Invoice::from(invoice)))
+			},
+			LdkPaidBolt12Invoice::StaticInvoice(invoice) => {
+				PaidBolt12Invoice::Static(Arc::new(StaticInvoice::from(invoice)))
+			},
+		}
+	}
+}
+
+impl From<PaidBolt12Invoice> for LdkPaidBolt12Invoice {
+	fn from(wrapper: PaidBolt12Invoice) -> Self {
+		match wrapper {
+			PaidBolt12Invoice::Bolt12(invoice) => {
+				LdkPaidBolt12Invoice::Bolt12Invoice(invoice.inner.clone())
+			},
+			PaidBolt12Invoice::Static(invoice) => {
+				LdkPaidBolt12Invoice::StaticInvoice(invoice.inner.clone())
+			},
+		}
+	}
+}
+
+impl Writeable for PaidBolt12Invoice {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), lightning::io::Error> {
+		// TODO: Find way to avoid cloning invoice data.
+		let ldk_type: LdkPaidBolt12Invoice = self.clone().into();
+		ldk_type.write(w)
+	}
+}
+
+impl Readable for PaidBolt12Invoice {
+	fn read<R: lightning::io::Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let ldk_type = LdkPaidBolt12Invoice::read(r)?;
+		Ok(ldk_type.into())
+	}
+}
+
+uniffi::custom_type!(OfferId, String, {
+	remote,
+	try_lift: |val| {
 		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
 			let bytes_res = bytes_vec.try_into();
 			if let Ok(bytes) = bytes_res {
@@ -697,17 +878,15 @@ impl UniffiCustomTypeConverter for OfferId {
 			}
 		}
 		Err(Error::InvalidOfferId.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		hex_utils::to_string(&obj.0)
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for PaymentId {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(PaymentId, String, {
+	remote,
+	try_lift: |val| {
 		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
 			let bytes_res = bytes_vec.try_into();
 			if let Ok(bytes) = bytes_res {
@@ -715,33 +894,29 @@ impl UniffiCustomTypeConverter for PaymentId {
 			}
 		}
 		Err(Error::InvalidPaymentId.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		hex_utils::to_string(&obj.0)
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for PaymentHash {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(PaymentHash, String, {
+	remote,
+	try_lift: |val| {
 		if let Ok(hash) = Sha256::from_str(&val) {
 			Ok(PaymentHash(hash.to_byte_array()))
 		} else {
 			Err(Error::InvalidPaymentHash.into())
 		}
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		Sha256::from_slice(&obj.0).unwrap().to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for PaymentPreimage {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(PaymentPreimage, String, {
+	remote,
+	try_lift: |val| {
 		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
 			let bytes_res = bytes_vec.try_into();
 			if let Ok(bytes) = bytes_res {
@@ -749,17 +924,15 @@ impl UniffiCustomTypeConverter for PaymentPreimage {
 			}
 		}
 		Err(Error::InvalidPaymentPreimage.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		hex_utils::to_string(&obj.0)
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for PaymentSecret {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(PaymentSecret, String, {
+	remote,
+	try_lift: |val| {
 		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
 			let bytes_res = bytes_vec.try_into();
 			if let Ok(bytes) = bytes_res {
@@ -767,17 +940,15 @@ impl UniffiCustomTypeConverter for PaymentSecret {
 			}
 		}
 		Err(Error::InvalidPaymentSecret.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		hex_utils::to_string(&obj.0)
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for ChannelId {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(ChannelId, String, {
+	remote,
+	try_lift: |val| {
 		if let Some(hex_vec) = hex_utils::to_vec(&val) {
 			if hex_vec.len() == 32 {
 				let mut channel_id = [0u8; 32];
@@ -786,95 +957,85 @@ impl UniffiCustomTypeConverter for ChannelId {
 			}
 		}
 		Err(Error::InvalidChannelId.into())
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		hex_utils::to_string(&obj.0)
 	}
-}
+});
 
-impl UniffiCustomTypeConverter for UserChannelId {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(UserChannelId, String, {
+	remote,
+	try_lift: |val| {
 		Ok(UserChannelId(u128::from_str(&val).map_err(|_| Error::InvalidChannelId)?))
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.0.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for Txid {
-	type Builtin = String;
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(Txid, String, {
+	remote,
+	try_lift: |val| {
 		Ok(Txid::from_str(&val)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for BlockHash {
-	type Builtin = String;
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(BlockHash, String, {
+	remote,
+	try_lift: |val| {
 		Ok(BlockHash::from_str(&val)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for Mnemonic {
-	type Builtin = String;
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(Mnemonic, String, {
+	remote,
+	try_lift: |val| {
 		Ok(Mnemonic::from_str(&val).map_err(|_| Error::InvalidSecretKey)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for SocketAddress {
-	type Builtin = String;
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(SocketAddress, String, {
+	remote,
+	try_lift: |val| {
 		Ok(SocketAddress::from_str(&val).map_err(|_| Error::InvalidSocketAddress)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for UntrustedString {
-	type Builtin = String;
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(UntrustedString, String, {
+	remote,
+	try_lift: |val| {
 		Ok(UntrustedString(val))
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for NodeAlias {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(NodeAlias, String, {
+	remote,
+	try_lift: |val| {
 		Ok(sanitize_alias(&val).map_err(|_| Error::InvalidNodeAlias)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_string()
-	}
-}
+	},
+});
 
 /// Represents the description of an invoice which has to be either a directly included string or
 /// a hash of a description provided out of band.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Bolt11InvoiceDescription {
 	/// Contains a full description.
 	Direct {
@@ -967,7 +1128,7 @@ impl From<lightning_invoice::Currency> for Currency {
 ///
 /// While this generally comes from BOLT 11's `r` field, this struct includes more fields than are
 /// available in BOLT 11.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RouteHintHop {
 	/// The node_id of the non-target end of the route
 	pub src_node_id: PublicKey,
@@ -997,12 +1158,15 @@ impl From<lightning::routing::router::RouteHintHop> for RouteHintHop {
 }
 
 /// Represents a syntactically and semantically correct lightning BOLT11 invoice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
 pub struct Bolt11Invoice {
 	pub(crate) inner: LdkBolt11Invoice,
 }
 
+#[uniffi::export]
 impl Bolt11Invoice {
+	#[uniffi::constructor]
 	pub fn from_str(invoice_str: &str) -> Result<Self, Error> {
 		invoice_str.parse()
 	}
@@ -1139,7 +1303,7 @@ impl std::fmt::Display for Bolt11Invoice {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct LSPS1PaymentInfo {
 	/// A Lightning payment using BOLT 11.
 	pub bolt11: Option<crate::ffi::LSPS1Bolt11PaymentInfo>,
@@ -1159,7 +1323,7 @@ impl From<lightning_liquidity::lsps1::msgs::LSPS1PaymentInfo> for LSPS1PaymentIn
 
 /// An onchain payment.
 #[cfg(feature = "uniffi")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct LSPS1OnchainPaymentInfo {
 	/// Indicates the current state of the payment.
 	pub state: lightning_liquidity::lsps1::msgs::LSPS1PaymentState,
@@ -1198,7 +1362,7 @@ impl From<lightning_liquidity::lsps1::msgs::LSPS1OnchainPaymentInfo> for LSPS1On
 	}
 }
 /// A Lightning payment using BOLT 11.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct LSPS1Bolt11PaymentInfo {
 	/// Indicates the current state of the payment.
 	pub state: LSPS1PaymentState,
@@ -1224,28 +1388,105 @@ impl From<lightning_liquidity::lsps1::msgs::LSPS1Bolt11PaymentInfo> for LSPS1Bol
 	}
 }
 
-impl UniffiCustomTypeConverter for LSPS1OrderId {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(LSPS1OrderId, String, {
+	remote,
+	try_lift: |val| {
 		Ok(Self(val))
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.0
-	}
-}
+	},
+});
 
-impl UniffiCustomTypeConverter for LSPSDateTime {
-	type Builtin = String;
-
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+uniffi::custom_type!(LSPSDateTime, String, {
+	remote,
+	try_lift: |val| {
 		Ok(LSPSDateTime::from_str(&val).map_err(|_| Error::InvalidDateTime)?)
-	}
-
-	fn from_custom(obj: Self) -> Self::Builtin {
+	},
+	lower: |obj| {
 		obj.to_rfc3339()
-	}
+	},
+});
+
+/// The reason the channel was closed. See individual variants for more details.
+#[uniffi::remote(Enum)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClosureReason {
+	/// Closure generated from receiving a peer error message.
+	///
+	/// Our counterparty may have broadcasted their latest commitment state, and we have
+	/// as well.
+	CounterpartyForceClosed {
+		/// The error which the peer sent us.
+		///
+		/// Be careful about printing the peer_msg, a well-crafted message could exploit
+		/// a security vulnerability in the terminal emulator or the logging subsystem.
+		peer_msg: UntrustedString,
+	},
+	/// Closure generated from a force close initiated by us.
+	HolderForceClosed {
+		/// Whether or not the latest transaction was broadcasted when the channel was force
+		/// closed.
+		///
+		/// This will be set to `Some(true)` for any channels closed after their funding
+		/// transaction was (or might have been) broadcasted, and `Some(false)` for any channels
+		/// closed prior to their funding transaction being broadcasted.
+		broadcasted_latest_txn: Option<bool>,
+		/// The error message provided when initiating the force close.
+		message: String,
+	},
+	/// The channel was closed after negotiating a cooperative close and we've now broadcasted
+	/// the cooperative close transaction. Note the shutdown may have been initiated by us.
+	LegacyCooperativeClosure,
+	/// The channel was closed after negotiating a cooperative close and we've now broadcasted
+	/// the cooperative close transaction. This indicates that the shutdown was initiated by our
+	/// counterparty.
+	///
+	/// In rare cases where we initiated closure immediately prior to shutting down without
+	/// persisting, this value may be provided for channels we initiated closure for.
+	CounterpartyInitiatedCooperativeClosure,
+	/// The channel was closed after negotiating a cooperative close and we've now broadcasted
+	/// the cooperative close transaction. This indicates that the shutdown was initiated by us.
+	LocallyInitiatedCooperativeClosure,
+	/// A commitment transaction was confirmed on chain, closing the channel. Most likely this
+	/// commitment transaction came from our counterparty, but it may also have come from
+	/// a copy of our own channel monitor.
+	CommitmentTxConfirmed,
+	/// The funding transaction failed to confirm in a timely manner on an inbound channel or the
+	/// counterparty failed to fund the channel in a timely manner.
+	FundingTimedOut,
+	/// Closure generated from processing an event, likely a HTLC forward/relay/reception.
+	ProcessingError {
+		/// A developer-readable error message which we generated.
+		err: String,
+	},
+	/// The peer disconnected prior to funding completing. In this case the spec mandates that we
+	/// forget the channel entirely - we can attempt again if the peer reconnects.
+	DisconnectedPeer,
+	/// Closure generated during deserialization if the channel monitor is newer than
+	/// the channel manager deserialized.
+	OutdatedChannelManager,
+	/// The counterparty requested a cooperative close of a channel that had not been funded yet.
+	/// The channel has been immediately closed.
+	CounterpartyCoopClosedUnfundedChannel,
+	/// We requested a cooperative close of a channel that had not been funded yet.
+	/// The channel has been immediately closed.
+	LocallyCoopClosedUnfundedChannel,
+	/// Another channel in the same funding batch closed before the funding transaction
+	/// was ready to be broadcast.
+	FundingBatchClosure,
+	/// One of our HTLCs timed out in a channel, causing us to force close the channel.
+	HTLCsTimedOut {
+		/// The payment hash of an HTLC that timed out.
+		payment_hash: Option<PaymentHash>,
+	},
+	/// Our peer provided a feerate which violated our required minimum.
+	PeerFeerateTooLow {
+		/// The feerate on our channel set by our peer.
+		peer_feerate_sat_per_kw: u32,
+		/// The required feerate we enforce.
+		required_feerate_sat_per_kw: u32,
+	},
 }
 
 #[cfg(test)]
